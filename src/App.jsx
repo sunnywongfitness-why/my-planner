@@ -78,22 +78,36 @@ function slotIndex(time) {
   const [h, m] = time.split(":").map(Number);
   return (h - 7) * 4 + m / 15;
 }
-// 呢一行係咪呢個 booking 嘅「顯示文字」行（取跨度中間嗰行，等色塊睇落似一個整塊，字又唔會逼喺最頂）
-function isLabelRow(entryStart, entryHours, rowTime) {
-  const span = Math.round(entryHours * 4);
-  const labelOffset = Math.floor((span - 1) / 2);
-  return slotIndex(rowTime) - slotIndex(entryStart) === labelOffset;
+// 將一個 booking 嘅顯示內容拆做幾行：教練名/類型、（學生名）、開始時間 —— 每行會分配落唔同嘅實際格仔
+function buildEntryLines(v, isTrial, coachObj, isOwner) {
+  const lines = [];
+  if (isTrial) {
+    lines.push({ text: `試堂${v.coachName ? " · " + v.coachName : ""}`, style: S.slotNameFull });
+  } else if (v.type === "charter") {
+    lines.push({ text: `${rentalShort(v.charterType)}${v.coachName ? " · " + v.coachName : ""}`, style: S.slotNameFull });
+  } else {
+    lines.push({ text: `${coachObj?.name || ""}${v.type === "duo" ? " · 1對2" : " · 1對1"}`, style: S.slotNameFull });
+    if (isOwner && v.students && v.students.length > 0) lines.push({ text: v.students.join("、"), style: S.slotStudentsFull });
+  }
+  lines.push({ text: v.start, style: S.slotTimeFull });
+  lines.push({ text: addMinutes(v.start, v.hours * 60), style: S.slotBottomTime });
+  return lines;
 }
 
 export default function App() {
   const [coaches, setCoaches] = useState(() => persisted("coaches", DEFAULT_COACHES));
   const [currentUser, setCurrentUser] = useState(null);
   const [adminPassword, setAdminPassword] = useState(() => persisted("adminPassword", "admin123"));
+  const [subAdmins, setSubAdmins] = useState(() => persisted("subAdmins", [
+    { id: 1, username: "subadmin1", password: "1234", name: "副管理員1", permissions: { overview: true, schedule: true, coaches: true, ledger: true, records: true, settings: true } },
+    { id: 2, username: "subadmin2", password: "1234", name: "副管理員2", permissions: { overview: true, schedule: true, coaches: true, ledger: true, records: true, settings: true } },
+  ]));
   const [view, setView] = useState("login");
   // bookings: key date_time(15min) -> { coachId, start, hours, type }  (type: 'solo' | 'duo')
   const [bookings, setBookings] = useState(() => persisted("bookings", {}));
   const [purchaseLog, setPurchaseLog] = useState(() => persisted("purchaseLog", []));
   const [ledgerFilter, setLedgerFilter] = useState("all"); // coachId or "all"
+  const [ledgerMonth, setLedgerMonth] = useState("all"); // "all" or "YYYY-MM"
   const [editDateRec, setEditDateRec] = useState(null); // {id, date}
   const [weekOffset, setWeekOffset] = useState(0);
   const [bookModal, setBookModal] = useState(null);   // { date, time }
@@ -112,6 +126,7 @@ export default function App() {
     if (!d) return;
     if (d.coaches !== undefined) setCoaches(d.coaches);
     if (d.adminPassword !== undefined) setAdminPassword(d.adminPassword);
+    if (d.subAdmins !== undefined) setSubAdmins(d.subAdmins);
     if (d.bookings !== undefined) setBookings(d.bookings);
     if (d.purchaseLog !== undefined) setPurchaseLog(d.purchaseLog);
     if (d.charterLog !== undefined) setCharterLog(d.charterLog);
@@ -130,7 +145,7 @@ export default function App() {
         applyBundle(remote);
       } else {
         // 雲端未有資料：將目前（本機／預設）資料推上去做初始
-        const seed = { coaches, adminPassword, bookings, purchaseLog, charterLog, assistCancelLog, cancelLog };
+        const seed = { coaches, adminPassword, subAdmins, bookings, purchaseLog, charterLog, assistCancelLog, cancelLog };
         lastSyncedRef.current = stableStringify(seed);
         await cloudSave(seed);
       }
@@ -149,7 +164,7 @@ export default function App() {
 
   // 任何資料變更時儲存（雲端 or 本機）
   useEffect(() => {
-    const bundle = { coaches, adminPassword, bookings, purchaseLog, charterLog, assistCancelLog, cancelLog };
+    const bundle = { coaches, adminPassword, subAdmins, bookings, purchaseLog, charterLog, assistCancelLog, cancelLog };
     // 本機永遠都存一份（離線後備）
     try { localStorage.setItem(LS_KEY, JSON.stringify(bundle)); } catch (e) { /* ignore */ }
 
@@ -165,9 +180,10 @@ export default function App() {
       const ok = await cloudSave(bundle);
       setSyncState(ok ? "synced" : "error");
     }, 500);
-  }, [coaches, adminPassword, bookings, purchaseLog, charterLog, assistCancelLog, cancelLog]);
+  }, [coaches, adminPassword, subAdmins, bookings, purchaseLog, charterLog, assistCancelLog, cancelLog]);
 
   const [cancelModal, setCancelModal] = useState(null);
+  const [signModal, setSignModal] = useState(null); // {date,start,coachId,type,studentName}
   const [adminCancelModal, setAdminCancelModal] = useState(null); // {date,start,coachId,type}
   const [delLedgerModal, setDelLedgerModal] = useState(null); // ledger record to delete
   const [toast, setToast] = useState(null);
@@ -180,8 +196,14 @@ export default function App() {
   const [recCoach, setRecCoach] = useState("all");
   const [recType, setRecType] = useState("all"); // all|solo|duo|private|group|trial
   const [recRange, setRecRange] = useState("upcoming"); // upcoming|past|month|all
+  const [recMonth, setRecMonth] = useState(() => monthKey(formatDate(new Date())));
   const [recExpanded, setRecExpanded] = useState(null);
   const [coachSort, setCoachSort] = useState("remain"); // remain|paid|name
+  const [expandedCoachId, setExpandedCoachId] = useState(null);
+  const [viewMonth, setViewMonth] = useState(() => monthKey(formatDate(new Date())));
+  const [monthsExpanded, setMonthsExpanded] = useState(false);
+  const [newStudentName, setNewStudentName] = useState("");
+  const [studentLogOpen, setStudentLogOpen] = useState(null);
   const [resetModal, setResetModal] = useState(false);
   const [delCoachModal, setDelCoachModal] = useState(null); // coach pending deletion
   const [showPasswords, setShowPasswords] = useState(false);
@@ -195,6 +217,14 @@ export default function App() {
     if (uid === "admin") {
       if (loginForm.password === adminPassword) { setCurrentUser({ id: 0, name: "管理員", role: "admin" }); setView("admin"); }
       else showToast("管理員密碼錯誤", "error");
+      return;
+    }
+    const sub = subAdmins.find((s) => (s.username || "").toLowerCase() === uid && s.password === loginForm.password);
+    if (sub) {
+      setCurrentUser({ ...sub, role: "subadmin" });
+      setView("admin");
+      const firstAllowed = ["overview", "schedule", "coaches", "ledger", "records", "settings"].find((k) => sub.permissions?.[k]);
+      setAdminTab(firstAllowed || "settings");
       return;
     }
     const coach = coaches.find((c) => (c.username || "").toLowerCase() === uid && c.password === loginForm.password);
@@ -225,21 +255,51 @@ export default function App() {
     return null;
   };
 
+  // 將某一日嘅 booking 分配落 2 條「線」（座位），等已book嘅時段可以真正合併做一個跨幾行嘅格仔，
+  // 同一條線上嘅 entry 唔會撞時間，所以可以安全用 rowSpan；得返嗰條線繼續逐格顯示空格/「+」。
+  const buildDayPlan = (date) => {
+    const entries = [];
+    TIME_SLOTS.forEach((t) => { cellArr(date, t).forEach((e) => { if (e.start === t) entries.push(e); }); });
+    const wholeEntries = entries.filter(isWholeVenue);
+    const seatEntries = entries.filter((e) => !isWholeVenue(e));
+    seatEntries.sort((a, b) => slotIndex(a.start) - slotIndex(b.start));
+    const laneEndRow = [-1, -1];
+    seatEntries.forEach((e) => {
+      const startRow = slotIndex(e.start);
+      const span = Math.round(e.hours * 4);
+      const endRow = startRow + span - 1;
+      const lane = laneEndRow[0] < startRow ? 0 : (laneEndRow[1] < startRow ? 1 : null);
+      if (lane !== null) { e._lane = lane; laneEndRow[lane] = endRow; }
+    });
+    const plan = TIME_SLOTS.map(() => ({ whole: null, lane0: null, lane1: null }));
+    wholeEntries.forEach((e) => { const r = slotIndex(e.start); if (plan[r]) plan[r].whole = e; });
+    seatEntries.forEach((e) => { if (e._lane == null) return; const r = slotIndex(e.start); if (plan[r]) plan[r][`lane${e._lane}`] = e; });
+    return plan;
+  };
+
   const openBook = (date, time) => {
     if (isClosedDay(date)) return showToast("星期四、五休息，不開放預約", "error");
     if (soldOut) return showToast("你已用晒購買堂數，請聯絡管理員增購", "error");
-    setBookModal({ date, time, sessionType: "solo", hours: 1 });
+    const allowSolo = liveUser.allowSolo !== false;
+    const allowDuo = liveUser.allowDuo !== false;
+    if (!allowSolo && !allowDuo) return showToast("你冇任何可用嘅預約類型，請聯絡管理員設定", "error");
+    setBookModal({ date, time, sessionType: allowSolo ? "solo" : "duo", hours: 1, students: [], studentOther: "" });
   };
 
   const confirmBook = () => {
     const { date, time, sessionType, hours } = bookModal;
+    if (sessionType === "solo" && liveUser.allowSolo === false) { showToast("你冇一對一預約權限", "error"); return; }
+    if (sessionType === "duo" && liveUser.allowDuo === false) { showToast("你冇一對二預約權限", "error"); return; }
     const creditCost = hours; // 1hr = 1堂, 1.5hr = 1.5堂
     if (creditCost > remaining) { showToast("剩餘堂數不足", "error"); return; }
     const err = canPlace(date, time, hours);
     if (err) { showToast(err, "error"); return; }
     const price = sessionType === "duo" ? duoPrice(hours) : liveUser.rate * hours;
     const slots = slotsFor(time, hours);
-    const entry = { coachId: currentUser.id, start: time, hours, type: sessionType, price, createdAt: new Date().toISOString().slice(0, 16).replace("T", " ") };
+    const selected = Array.isArray(bookModal.students) ? bookModal.students : [];
+    const extra = (bookModal.studentOther || "").trim();
+    const studentList = [...selected, ...(extra ? [extra] : [])].filter(Boolean).slice(0, 4);
+    const entry = { coachId: currentUser.id, start: time, hours, type: sessionType, price, students: studentList, createdAt: new Date().toISOString().slice(0, 16).replace("T", " ") };
     setBookings((prev) => {
       const u = { ...prev };
       slots.forEach((s) => { u[`${date}_${s}`] = [...(u[`${date}_${s}`] || []), entry]; });
@@ -272,7 +332,8 @@ export default function App() {
 
   const openCancel = (date, start, coachId, type) => {
     const hrs = hoursUntil(date, start);
-    if (currentUser.role === "coach" && hrs < 24) return showToast("24小時內取消需要管理員協助", "error");
+    const win = getCoach(coachId)?.cancelWindowHours ?? 24;
+    if (currentUser.role === "coach" && hrs < win) return showToast(`${win}小時內取消需要管理員協助`, "error");
     setCancelModal({ date, start, coachId, type });
   };
 
@@ -301,8 +362,9 @@ export default function App() {
     }, ...prev]);
     if (meta.type !== "charter") {
       setCoaches((prev) => prev.map((c) => c.id === coachId ? { ...c, used: Math.max(0, c.used - meta.hours) } : c));
-      // 由管理員協助、而且係 24 小時內嘅取消，計入該教練本月額度
-      if (byAdmin && hoursUntil(date, start) < 24) {
+      // 由管理員協助、而且係該教練設定嘅通知時數內取消，計入本月額度
+      const win = getCoach(coachId)?.cancelWindowHours ?? 24;
+      if (byAdmin && hoursUntil(date, start) < win) {
         setAssistCancelLog((prev) => [{ coachId, month: monthKey(formatDate(new Date())), date, start }, ...prev]);
       }
     } else {
@@ -312,10 +374,43 @@ export default function App() {
     setCancelModal(null);
   };
 
+  // 學生簽到：將一個學生嘅簽名（base64 圖）寫入呢個 booking 嘅所有 15 分鐘格副本
+  const signIn = (date, start, coachId, type, studentName, dataUrl) => {
+    const startArr = cellArr(date, start);
+    const meta = startArr.find((e) => e.coachId === coachId && e.start === start && e.type === type);
+    if (!meta) return;
+    const slots = slotsFor(start, meta.hours);
+    setBookings((prev) => {
+      const u = { ...prev };
+      slots.forEach((s) => {
+        const arr = (u[`${date}_${s}`] || []).map((e) => {
+          if (e.coachId === coachId && e.start === start && e.type === type) {
+            return { ...e, signatures: { ...(e.signatures || {}), [studentName]: { dataUrl, signedAt: new Date().toISOString().slice(0, 16).replace("T", " ") } } };
+          }
+          return e;
+        });
+        u[`${date}_${s}`] = arr;
+      });
+      return u;
+    });
+    showToast(`${studentName} 已簽到`);
+  };
+
   // 教練本月已用 / 剩餘代取消額度
   const assistUsedThisMonth = (coachId) => {
     const m = monthKey(formatDate(new Date()));
     return assistCancelLog.filter((r) => r.coachId === coachId && r.month === m).length;
+  };
+
+  // 教練新增學生入自己嘅名單（去重、淨係自己改到自己嗰份）
+  const addStudentToRoster = () => {
+    const name = newStudentName.trim();
+    if (!name) return;
+    if (!isCoach) return;
+    const cur = liveUser.studentRoster || [];
+    if (cur.includes(name)) { showToast("呢個名已經喺名單度", "error"); return; }
+    setCoaches((prev) => prev.map((c) => c.id === currentUser.id ? { ...c, studentRoster: [...(c.studentRoster || []), name] } : c));
+    setNewStudentName("");
   };
 
   const changePassword = () => {
@@ -324,6 +419,10 @@ export default function App() {
     if (currentUser.role === "admin") {
       if (pwForm.old !== adminPassword) return showToast("舊密碼錯誤", "error");
       setAdminPassword(pwForm.new1);
+    } else if (currentUser.role === "subadmin") {
+      const me = subAdmins.find((s) => s.id === currentUser.id);
+      if (!me || pwForm.old !== me.password) return showToast("舊密碼錯誤", "error");
+      setSubAdmins((prev) => prev.map((s) => s.id === currentUser.id ? { ...s, password: pwForm.new1 } : s));
     } else {
       if (pwForm.old !== getCoach(currentUser.id).password) return showToast("舊密碼錯誤", "error");
       setCoaches((prev) => prev.map((c) => c.id === currentUser.id ? { ...c, password: pwForm.new1 } : c));
@@ -332,12 +431,32 @@ export default function App() {
     showToast("密碼已更新");
   };
 
-  const addCredits = (coachId, qty) => {
+  const addCredits = (coachId, qty, expiryDate) => {
     const coach = getCoach(coachId);
     const amount = qty * coach.rate;
     setCoaches((prev) => prev.map((c) => c.id === coachId ? { ...c, credits: c.credits + qty } : c));
-    setPurchaseLog((prev) => [{ id: "p" + Date.now() + "-" + Math.random().toString(36).slice(2), date: new Date().toISOString().slice(0, 10), coachId, coachName: coach.name, qty, amount, rate: coach.rate }, ...prev]);
-    showToast(`已為 ${coach.name} 增加 ${qty} 堂（$${amount}）`);
+    setPurchaseLog((prev) => [{ id: "p" + Date.now() + "-" + Math.random().toString(36).slice(2), date: new Date().toISOString().slice(0, 10), coachId, coachName: coach.name, qty, amount, rate: coach.rate, expiryDate: expiryDate || null }, ...prev]);
+    showToast(`已為 ${coach.name} 增加 ${qty} 堂（$${amount}）${expiryDate ? `，失效日：${expiryDate}` : ""}`);
+  };
+
+  // FIFO：將某教練嘅 used 堂數，依購買時間順序分配到每筆購買記錄，計出每筆嘅「已用／剩餘」
+  const purchaseFifoStatus = (coachId) => {
+    const batches = purchaseLog.filter((r) => r.coachId === coachId).slice().sort((a, b) => a.date.localeCompare(b.date));
+    const coach = getCoach(coachId);
+    let remainingToAllocate = coach ? coach.used : 0;
+    return batches.map((r) => {
+      const consumed = Math.min(r.qty, remainingToAllocate);
+      remainingToAllocate -= consumed;
+      return { ...r, consumed, remaining: r.qty - consumed };
+    });
+  };
+
+  // 邊位教練有「未用完、已過期或快過期」嘅堂數（用嚎提醒管理員／教練）
+  const EXPIRY_WARN_DAYS = 14;
+  const expiringBatchesOf = (coachId) => {
+    const today = formatDate(new Date());
+    return purchaseFifoStatus(coachId).filter((b) => b.remaining > 0 && b.expiryDate &&
+      (new Date(`${b.expiryDate}T00:00:00`) - new Date(`${today}T00:00:00`)) / 86400000 <= EXPIRY_WARN_DAYS);
   };
 
   // sanitize sheet names (Excel: <=31 chars, no : \ / ? * [ ])
@@ -438,10 +557,33 @@ export default function App() {
     const date = k.split("_")[0];
     arr.forEach((v) => {
       if (v.coachId === currentUser?.id && k === `${date}_${v.start}`)
-        myBookings.push({ date, start: v.start, hours: v.hours, type: v.type });
+        myBookings.push({ date, start: v.start, hours: v.hours, type: v.type, price: v.price || 0, students: v.students || [], signatures: v.signatures || {} });
     });
   });
   myBookings.sort((a, b) => `${a.date}${a.start}`.localeCompare(`${b.date}${b.start}`));
+
+  // 教練近3個月實際收入（扣除租場費用）+ 各學生上堂紀錄
+  const myIncomeReport = (() => {
+    if (!isCoach) return { months: [], studentLog: {} };
+    const now = new Date();
+    const months = [0, 1, 2].map((i) => {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const tm = monthKey(formatDate(d));
+      const bs = myBookings.filter((b) => monthKey(b.date) === tm);
+      const gross = bs.reduce((s, b) => s + (b.price || 0), 0);
+      const rentalCost = bs.reduce((s, b) => s + (liveUser.rate || 0) * b.hours, 0);
+      return { month: tm, gross, rentalCost, net: gross - rentalCost, count: bs.length };
+    });
+    const studentLog = {};
+    myBookings.forEach((b) => {
+      (b.students || []).forEach((n) => {
+        if (!studentLog[n]) studentLog[n] = [];
+        studentLog[n].push({ date: b.date, start: b.start, hours: b.hours, type: b.type });
+      });
+    });
+    Object.values(studentLog).forEach((arr) => arr.sort((a, b) => `${b.date}${b.start}`.localeCompare(`${a.date}${a.start}`)));
+    return { months, studentLog };
+  })();
 
   // ---------- LOGIN ----------
   if (view === "login") {
@@ -503,37 +645,53 @@ export default function App() {
     const totalClassRev = Object.values(classByMonth).reduce((a, b) => a + b, 0);
     const totalRevenue = totalPurchase + totalCharter; // 實收現金：買堂 + 包場/小組
 
-    // 本月總收入：本月買堂 + 本月包場/小組（試堂 $0 自動唔計）
+    // 指定月份總收入：該月買堂 + 該月包場/小組（試堂 $0 自動唔計）
     const thisMonth = monthKey(formatDate(new Date()));
-    const monthPurchase = purchaseLog.filter((r) => monthKey(r.date) === thisMonth).reduce((a, r) => a + r.amount, 0);
-    const monthCharter = charterLog.filter((r) => monthKey(r.bookDate) === thisMonth).reduce((a, r) => a + r.amount, 0);
+    const monthPurchase = purchaseLog.filter((r) => monthKey(r.date) === viewMonth).reduce((a, r) => a + r.amount, 0);
+    const monthCharter = charterLog.filter((r) => monthKey(r.bookDate) === viewMonth).reduce((a, r) => a + r.amount, 0);
     const monthRevenue = monthPurchase + monthCharter;
 
     // 各教練總付款（買堂 + 初始）
     const coachPaid = {};
     coaches.forEach((c) => { coachPaid[c.id] = purchaseLog.filter((r) => r.coachId === c.id).reduce((a, r) => a + r.amount, 0) + initialCreditsOf(c) * c.rate; });
 
+    const isSubAdmin = currentUser.role === "subadmin";
+    const visibleTabs = [["overview", "📊 總覽"], ["schedule", "📅 課表"], ["coaches", "👥 教練"], ["ledger", "💰 流水帳"], ["records", "📋 記錄"], ["settings", "⚙️ 設定"]]
+      .filter(([k]) => !isSubAdmin || currentUser.permissions?.[k]);
     return (
       <div style={S.appBg}>
-        <Header title="管理員" onLogout={logout} syncState={syncState} />
+        <Header title={isSubAdmin ? `副管理員 · ${currentUser.name}` : "管理員"} onLogout={logout} syncState={syncState} />
         <div style={S.tabRow}>
-          {[["overview", "📊 總覽"], ["schedule", "📅 課表"], ["coaches", "👥 教練"], ["ledger", "💰 流水帳"], ["records", "📋 記錄"], ["settings", "⚙️ 設定"]].map(([k, label]) => (
+          {visibleTabs.map(([k, label]) => (
             <button key={k} style={adminTab === k ? S.tabActive : S.tab} onClick={() => setAdminTab(k)}>{label}</button>
           ))}
         </div>
 
+        {isSubAdmin && !visibleTabs.some(([k]) => k === adminTab) && (
+          <div style={S.container}><p style={S.emptyText}>你呢個帳戶暫時冇任何已啟用嘅功能，請聯絡管理員開通。</p></div>
+        )}
+
         {adminTab === "overview" && (
           <div style={S.container}>
+            <div style={{ ...S.flexBetween, marginBottom: 10 }}>
+              <span style={{ fontSize: 12, color: "#888" }}>查看月份</span>
+              <input style={S.select} type="month" value={viewMonth} onChange={(e) => setViewMonth(e.target.value)} />
+            </div>
             <div style={S.kpiRow}>
-              <div style={S.kpiCard}><div style={S.kpiLabel}>本月總收入</div><div style={S.kpiBig}>${monthRevenue.toLocaleString()}</div></div>
+              <div style={S.kpiCard}><div style={S.kpiLabel}>{viewMonth === thisMonth ? "本月總收入" : `${viewMonth} 收入`}</div><div style={S.kpiBig}>${monthRevenue.toLocaleString()}</div></div>
               <div style={S.kpiCard}><div style={S.kpiLabel}>已上堂數</div><div style={S.kpiBig}>{totalUsed}</div></div>
               <div style={S.kpiCard}><div style={S.kpiLabel}>已售堂數</div><div style={S.kpiBig}>{totalSold}</div></div>
             </div>
             <p style={S.assistHint}>本月＝{thisMonth}　｜　累計總收入 ${totalRevenue.toLocaleString()}</p>
 
-            <h2 style={S.sectionTitle}>每月收入</h2>
+            <div style={{ ...S.flexBetween, marginBottom: 0 }}>
+              <h2 style={S.sectionTitle}>每月收入</h2>
+              {allMonths.length > 6 && (
+                <button style={S.linkBtn} onClick={() => setMonthsExpanded((v) => !v)}>{monthsExpanded ? "收埋" : `顯示全部（${allMonths.length}）`}</button>
+              )}
+            </div>
             <div style={S.bookingList}>
-              {allMonths.length === 0 ? <p style={S.emptyText}>暫無收入</p> : allMonths.map((m) => (
+              {allMonths.length === 0 ? <p style={S.emptyText}>暫無收入</p> : (monthsExpanded ? allMonths : allMonths.slice(0, 6)).map((m) => (
                 <div key={m} style={S.monthCard}>
                   <div style={S.monthHead}>{m === "初始" ? "初始已售堂數" : m}</div>
                   <div style={S.monthRow}><span style={S.monthLabel}>一筆過租金（買堂）</span><span style={S.revenueNum}>${(purchaseByMonth[m] || 0).toLocaleString()}</span></div>
@@ -541,6 +699,7 @@ export default function App() {
                 </div>
               ))}
             </div>
+            {!monthsExpanded && allMonths.length > 6 && <p style={S.assistHint}>顯示最近 6 個月，撳上面「顯示全部」睇齊歷史。</p>}
             <p style={S.assistHint}>「一筆過租金」= 教練買堂時實收現金；「實際堂數收入」= 當月實際 book 咗嘅堂（一對一／一對二／包場）價值。</p>
 
             <div style={{ ...S.flexBetween, marginTop: 24 }}>
@@ -553,6 +712,7 @@ export default function App() {
             </div>
             {(() => {
               const lowList = coaches.filter((c) => (c.credits - c.used) <= LOW_CREDIT_THRESHOLD);
+              const expiringCoaches = coaches.filter((c) => expiringBatchesOf(c.id).length > 0);
               const sorted = [...coaches].sort((a, b) => {
                 if (coachSort === "paid") return (coachPaid[b.id] || 0) - (coachPaid[a.id] || 0);
                 if (coachSort === "name") return a.name.localeCompare(b.name);
@@ -565,21 +725,53 @@ export default function App() {
                     ⚠️ 堂數快用完（剩 ≤ {LOW_CREDIT_THRESHOLD}）：{lowList.map((c) => `${c.name}（剩${c.credits - c.used}）`).join("、")}　— 可提早提醒增購
                   </div>
                 )}
+                {expiringCoaches.length > 0 && (
+                  <div style={{ ...S.lowWarnBox, background: "#332a0f", color: "#FFB347" }}>
+                    ⏰ 堂數即將／已經過期：{expiringCoaches.map((c) => {
+                      const batches = expiringBatchesOf(c.id);
+                      return `${c.name}（${batches.map((b) => `${b.remaining}堂@${b.expiryDate}`).join("、")}）`;
+                    }).join("　")}
+                  </div>
+                )}
                 <div style={{ ...S.bookingList, marginTop: 12 }}>
                   {sorted.map((c) => {
                     const remain = c.credits - c.used;
                     const low = remain <= LOW_CREDIT_THRESHOLD;
+                    const expanded = expandedCoachId === c.id;
+                    const fifo = expanded ? purchaseFifoStatus(c.id) : [];
                     return (
-                      <div key={c.id} style={S.coachStatRow}>
-                        <div style={{ ...S.avatar, background: c.color }}>{c.initials}</div>
-                        <div style={{ flex: 1 }}>
-                          <div style={S.bookingCoach}>{c.name}{low && <span style={S.lowPill}>低</span>}</div>
-                          <div style={S.bookingTime}>每堂 ${c.rate}　已用 {c.used}/{c.credits} 堂</div>
+                      <div key={c.id}>
+                        <div style={{ ...S.coachStatRow, cursor: "pointer" }} onClick={() => setExpandedCoachId(expanded ? null : c.id)}>
+                          <div style={{ ...S.avatar, background: c.color }}>{c.initials}</div>
+                          <div style={{ flex: 1 }}>
+                            <div style={S.bookingCoach}>{c.name}{low && <span style={S.lowPill}>低</span>}</div>
+                            <div style={S.bookingTime}>每堂 ${c.rate}　已用 {c.used}/{c.credits} 堂</div>
+                          </div>
+                          <div style={{ textAlign: "right" }}>
+                            <div style={S.revenueNum}>${(coachPaid[c.id] || 0).toLocaleString()}</div>
+                            <div style={S.bookingTime}>總付款　剩 <span style={{ color: low ? "#FF8FA3" : "#aaa", fontWeight: low ? 700 : 400 }}>{remain}</span> 堂</div>
+                          </div>
                         </div>
-                        <div style={{ textAlign: "right" }}>
-                          <div style={S.revenueNum}>${(coachPaid[c.id] || 0).toLocaleString()}</div>
-                          <div style={S.bookingTime}>總付款　剩 <span style={{ color: low ? "#FF8FA3" : "#aaa", fontWeight: low ? 700 : 400 }}>{remain}</span> 堂</div>
-                        </div>
+                        {expanded && (
+                          <div style={S.purchaseBreakdown}>
+                            {fifo.length === 0 ? <p style={S.emptyText}>暫無購買記錄</p> : fifo.map((b) => {
+                              const isExpired = b.expiryDate && b.remaining > 0 && b.expiryDate < formatDate(new Date());
+                              const isExpiring = !isExpired && b.expiryDate && b.remaining > 0 && expiringBatchesOf(c.id).some((x) => x.id === b.id);
+                              return (
+                                <div key={b.id} style={S.purchaseRow}>
+                                  <div>
+                                    <div style={S.bookingTime}>{b.date}　+{b.qty} 堂　$@{b.rate}</div>
+                                    {b.expiryDate && <div style={{ fontSize: 11, color: isExpired ? "#FF6B6B" : isExpiring ? "#FFB347" : "#666" }}>失效日：{b.expiryDate}{isExpired ? "（已過期）" : isExpiring ? "（快到期）" : ""}</div>}
+                                  </div>
+                                  <div style={{ textAlign: "right", fontSize: 12 }}>
+                                    <div style={{ color: "#6BCB77" }}>已用 {b.consumed}</div>
+                                    <div style={{ color: b.remaining > 0 ? "#4ECDC4" : "#555" }}>剩 {b.remaining}</div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -590,7 +782,10 @@ export default function App() {
           </div>
         )}
 
-        {adminTab === "schedule" && (
+        {adminTab === "schedule" && (() => {
+          const dayPlans = {}; const dayCov = {};
+          days.forEach((d) => { const date = formatDate(d); dayPlans[date] = buildDayPlan(date); dayCov[date] = { whole: 0, lane0: 0, lane1: 0 }; });
+          return (
           <div style={S.calContainer}>
             <h2 style={S.sectionTitle}>全部教練課表</h2>
             <p style={S.gridHint}>一覽所有教練同其他租場嘅預約。撳已預約嘅格協助取消；撳空格可落其他租場（包場／小組／試堂）。</p>
@@ -602,60 +797,80 @@ export default function App() {
             <div style={S.calScroll}>
               <table style={S.table}>
                 <thead><tr><th style={S.thTime}></th>
-                  {days.map((d) => { const closed = CLOSED_DAYS.includes(d.getDay()); const today = isTodayDate(d); return <th key={d} style={{ ...S.th, background: today ? "#13302e" : undefined }}><div style={{ ...S.dayLabel, color: closed ? "#5a3030" : undefined }}>{formatDay(d)}</div><div style={{ ...S.dateLabel, color: closed ? "#555" : today ? "#4ECDC4" : undefined }}>{d.getDate()}</div>{today ? <div style={S.todayTag}>今日</div> : closed ? <div style={S.closedTag}>休息</div> : null}</th>; })}
+                  {days.map((d) => { const closed = CLOSED_DAYS.includes(d.getDay()); const today = isTodayDate(d); return <th key={d} colSpan={2} style={{ ...S.th, background: today ? "#13302e" : undefined }}><div style={{ ...S.dayLabel, color: closed ? "#5a3030" : undefined }}>{formatDay(d)}</div><div style={{ ...S.dateLabel, color: closed ? "#555" : today ? "#4ECDC4" : undefined }}>{d.getDate()}</div>{today ? <div style={S.todayTag}>今日</div> : closed ? <div style={S.closedTag}>休息</div> : null}</th>; })}
                 </tr></thead>
                 <tbody>
-                  {TIME_SLOTS.map((time) => {
+                  {TIME_SLOTS.map((time, rowIdx) => {
                     const isHourStart = time.endsWith(":00");
                     return (
                       <tr key={time}>
                         <td style={{ ...S.tdTime, color: isHourStart ? "#aaa" : "#3a3a3a" }}>{time}</td>
                         {days.map((d) => {
                           const date = formatDate(d);
-                          const here = cellArr(date, time);
-                          const occ = occupancy(date, time);
-                          const whole = here.find(isWholeVenue);
+                          const cov = dayCov[date];
+                          const cell = dayPlans[date][rowIdx];
                           const isPast = hoursUntil(date, time) < 0;
                           const closed = isClosedDay(date);
-                          const canAdd = occ < MAX_CONCURRENT && !isPast && !closed;
-                          return (
-                            <td key={date} style={{ ...S.td, borderTop: isHourStart ? "1px solid #2a2a2a" : "1px solid #161616", background: closed && here.length === 0 ? "#0c0c0c" : undefined }}>
-                              {whole ? (
-                                <div style={{ ...S.slotChip, background: "#ffffff22", borderLeft: "3px solid #fff", alignItems: "flex-start" }}>
-                                  {isLabelRow(whole.start, whole.hours, time) && (
-                                    <span style={S.slotLabelBlock}>
-                                      <span style={S.slotNameFull}>{rentalShort(whole.charterType)}{whole.coachName ? ` · ${whole.coachName}` : ""}</span>
-                                      <span style={S.slotTimeFull}>{whole.start}–{addMinutes(whole.start, whole.hours * 60)}</span>
-                                    </span>
-                                  )}
-                                  {isLabelRow(whole.start, whole.hours, time) &&
-                                    <button style={S.cancelSlotBtn} onClick={() => setAdminCancelModal({ date, start: whole.start, coachId: 0, type: "charter" })}>✕</button>}
+                          const occ = occupancy(date, time);
+                          const tdBase = { ...S.td, borderTop: isHourStart ? "1px solid #2a2a2a" : "1px solid #161616" };
+
+                          if (cov.whole > 0) { cov.whole--; return null; }
+                          if (cell.whole) {
+                            const span = Math.round(cell.whole.hours * 4);
+                            cov.whole = span - 1;
+                            const lines = buildEntryLines(cell.whole, false, null, false);
+                            return (
+                              <td key={date} colSpan={2} rowSpan={span} style={tdBase}>
+                                <div style={{ ...S.slotChipMerged, background: "#ffffff22", borderLeft: "3px solid #fff" }}>
+                                  <button style={S.cancelSlotBtnAbs} onClick={() => setAdminCancelModal({ date, start: cell.whole.start, coachId: 0, type: "charter" })}>✕</button>
+                                  {lines.map((l, i) => <span key={i} style={l.style}>{l.text}</span>)}
                                 </div>
-                              ) : here.length > 0 ? (
-                                <div style={S.slotMulti}>
-                                  {here.map((v, idx) => {
-                                    const showLabel = isLabelRow(v.start, v.hours, time);
-                                    const isTrial = v.type === "charter";
-                                    const c = isTrial ? null : getCoach(v.coachId);
-                                    return (
-                                      <div key={idx} style={{ ...S.slotChip, background: isTrial ? "#ffffff22" : c?.color + "33", borderLeft: `3px solid ${isTrial ? "#fff" : c?.color}`, alignItems: "flex-start" }}>
-                                        {showLabel && (
-                                          <span style={S.slotLabelBlock}>
-                                            <span style={S.slotNameFull}>{isTrial ? `試堂${v.coachName ? " · " + v.coachName : ""}` : `${c?.name}${v.type === "duo" ? " ²" : ""}`}</span>
-                                            <span style={S.slotTimeFull}>{v.start}–{addMinutes(v.start, v.hours * 60)}</span>
-                                          </span>
-                                        )}
-                                        {showLabel && <button style={S.cancelSlotBtn} onClick={() => setAdminCancelModal({ date, start: v.start, coachId: v.coachId, type: v.type })}>✕</button>}
-                                      </div>
-                                    );
-                                  })}
-                                  {canAdd && <button style={S.slotAdd} onClick={() => setCharterModal({ date, time, charterType: "trial", hours: 1, price: 0, coachName: "" })}>+</button>}
-                                </div>
-                              ) : closed ? <div style={S.slotClosed} />
-                                : isPast ? <div style={S.slotPast} />
-                                : <button style={S.slotEmpty} onClick={() => setCharterModal({ date, time, charterType: "private", hours: 1, price: CHARTER_PRICE, coachName: "" })}>+</button>}
-                            </td>
-                          );
+                              </td>
+                            );
+                          }
+
+                          const lane0Active = cov.lane0 > 0 || cell.lane0;
+                          const lane1Active = cov.lane1 > 0 || cell.lane1;
+                          if (!lane0Active && !lane1Active) {
+                            return (
+                              <td key={date} colSpan={2} style={{ ...tdBase, background: closed ? "#0c0c0c" : undefined }}>
+                                {closed ? <div style={S.slotClosed} />
+                                  : isPast ? <div style={S.slotPast} />
+                                  : <button style={S.slotEmpty} onClick={() => setCharterModal({ date, time, charterType: "private", hours: 1, price: CHARTER_PRICE, coachName: "" })}>+</button>}
+                              </td>
+                            );
+                          }
+
+                          const laneTd = (laneKey) => {
+                            if (cov[laneKey] > 0) { cov[laneKey]--; return null; }
+                            const v = cell[laneKey];
+                            if (v) {
+                              const span = Math.round(v.hours * 4);
+                              cov[laneKey] = span - 1;
+                              const isTrial = v.type === "charter";
+                              const c = isTrial ? null : getCoach(v.coachId);
+                              const lines = buildEntryLines(v, isTrial, c, false);
+                              return (
+                                <td key={date + laneKey} rowSpan={span} style={tdBase}>
+                                  <div style={{ ...S.slotChipMerged, background: isTrial ? "#ffffff22" : c?.color + "33", borderLeft: `3px solid ${isTrial ? "#fff" : c?.color}` }}>
+                                    <button style={S.cancelSlotBtnAbs} onClick={() => setAdminCancelModal({ date, start: v.start, coachId: v.coachId, type: v.type })}>✕</button>
+                                    {lines.map((l, i) => <span key={i} style={l.style}>{l.text}</span>)}
+                                  </div>
+                                </td>
+                              );
+                            }
+                            const canAddHere = occ < MAX_CONCURRENT && !isPast && !closed;
+                            return (
+                              <td key={date + laneKey} style={{ ...tdBase, background: closed ? "#0c0c0c" : undefined }}>
+                                {closed ? <div style={S.slotClosed} />
+                                  : isPast ? <div style={S.slotPast} />
+                                  : canAddHere ? <button style={S.slotAdd2} onClick={() => setCharterModal({ date, time, charterType: "trial", hours: 1, price: 0, coachName: "" })}>+</button>
+                                  : <div style={S.slotDisabled} />}
+                              </td>
+                            );
+                          };
+
+                          return <>{laneTd("lane0")}{laneTd("lane1")}</>;
                         })}
                       </tr>
                     );
@@ -665,7 +880,8 @@ export default function App() {
             </div>
             <p style={S.assistHint}>² = 1對2　｜　白色 = 其他租場（包場／小組／試堂）</p>
           </div>
-        )}
+          );
+        })()}
 
         {adminTab === "coaches" && (
           <div style={S.container}>
@@ -684,7 +900,7 @@ export default function App() {
                     <div style={S.bookingCoach}>{c.name} <span style={S.idTag}>@{c.username}</span></div>
                     <div style={S.bookingTime}>堂數 {c.used}/{c.credits}　每堂 ${c.rate}　密碼 {showPasswords ? c.password : "••••"}</div>
                   </div>
-                  <button style={S.creditBtn} onClick={() => setAddCreditModal({ coachId: c.id, qty: 1 })}>+ 堂</button>
+                  <button style={S.creditBtn} onClick={() => setAddCreditModal({ coachId: c.id, qty: 1, expiryDate: "" })}>+ 堂</button>
                   <button style={S.smallBtn} onClick={() => setEditCoach(c)}>編輯</button>
                   <button style={S.delBtn} onClick={() => setDelCoachModal(c)}>刪</button>
                 </div>
@@ -694,7 +910,8 @@ export default function App() {
         )}
 
         {adminTab === "ledger" && (() => {
-          const filtered = ledgerFilter === "all" ? purchaseLog : purchaseLog.filter((r) => String(r.coachId) === String(ledgerFilter));
+          let filtered = ledgerFilter === "all" ? purchaseLog : purchaseLog.filter((r) => String(r.coachId) === String(ledgerFilter));
+          if (ledgerMonth !== "all") filtered = filtered.filter((r) => monthKey(r.date) === ledgerMonth);
           const filteredTotal = filtered.reduce((s, r) => s + r.amount, 0);
           return (
           <div style={S.container}>
@@ -705,6 +922,11 @@ export default function App() {
                 <option value="all">全部</option>
                 {coaches.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
               </select>
+              <span style={{ ...S.filterLabel, marginLeft: 10 }}>月份：</span>
+              {ledgerMonth === "all"
+                ? <button style={S.smallBtn} onClick={() => setLedgerMonth(monthKey(formatDate(new Date())))}>選擇月份</button>
+                : <><input style={S.select} type="month" value={ledgerMonth} onChange={(e) => setLedgerMonth(e.target.value)} />
+                   <button style={S.linkBtn} onClick={() => setLedgerMonth("all")}>清除</button></>}
             </div>
             {filtered.length === 0 ? <p style={S.emptyText}>暫無購買記錄</p> : (
               <div style={S.bookingList}>
@@ -726,7 +948,7 @@ export default function App() {
                 ))}
               </div>
             )}
-            {filtered.length > 0 && <div style={S.ledgerTotal}>{ledgerFilter === "all" ? "流水帳總額" : `${getCoach(ledgerFilter)?.name} 小計`}：${filteredTotal.toLocaleString()}</div>}
+            {filtered.length > 0 && <div style={S.ledgerTotal}>{ledgerFilter === "all" ? "流水帳總額" : `${getCoach(ledgerFilter)?.name} 小計`}{ledgerMonth !== "all" ? `（${ledgerMonth}）` : ""}：${filteredTotal.toLocaleString()}</div>}
           </div>
           );
         })()}
@@ -741,7 +963,6 @@ export default function App() {
 
             {recordsView === "bookings" ? (() => {
               const now = new Date();
-              const tm = monthKey(formatDate(now));
               const typeOf = (b) => b.type === "charter" ? (b.charterType || "private") : b.type;
               let list = allBookings.filter((b) => {
                 if (recCoach !== "all") { if (b.type === "charter") return false; if (String(b.coachId) !== String(recCoach)) return false; }
@@ -749,7 +970,7 @@ export default function App() {
                 const isPast = new Date(`${b.date}T${b.start}:00`) < now;
                 if (recRange === "upcoming" && isPast) return false;
                 if (recRange === "past" && !isPast) return false;
-                if (recRange === "month" && monthKey(b.date) !== tm) return false;
+                if (recRange === "month" && monthKey(b.date) !== recMonth) return false;
                 return true;
               });
               list.sort((a, b) => recRange === "upcoming"
@@ -774,9 +995,10 @@ export default function App() {
                   <select style={S.select} value={recRange} onChange={(e) => setRecRange(e.target.value)}>
                     <option value="upcoming">即將</option>
                     <option value="past">已完成</option>
-                    <option value="month">本月</option>
+                    <option value="month">指定年月</option>
                     <option value="all">全部</option>
                   </select>
+                  {recRange === "month" && <input style={S.select} type="month" value={recMonth} onChange={(e) => setRecMonth(e.target.value)} />}
                 </div>
                 <div style={S.recSummary}>共 {list.length} 項　｜　收入 ${sumRevenue.toLocaleString()}</div>
                 <div style={S.bookingList}>
@@ -839,7 +1061,7 @@ export default function App() {
 
         {adminTab === "settings" && (
           <div style={S.container}>
-            <h2 style={S.sectionTitle}>修改管理員密碼</h2>
+            <h2 style={S.sectionTitle}>修改{isSubAdmin ? "我的" : "管理員"}密碼</h2>
             <div style={S.formCard}>
               <Field label="舊密碼"><input style={S.input} type="password" value={pwForm.old} onChange={(e) => setPwForm({ ...pwForm, old: e.target.value })} /></Field>
               <Field label="新密碼"><input style={S.input} type="password" value={pwForm.new1} onChange={(e) => setPwForm({ ...pwForm, new1: e.target.value })} /></Field>
@@ -856,11 +1078,51 @@ export default function App() {
               <p style={{ ...S.assistHint, marginTop: 10 }}>※ 若下載冇反應（手機 app 常見），可改按「複製流水帳」再貼入 Excel / Google Sheets；或喺電腦瀏覽器開啟再匯出。</p>
             </div>
 
-            <h2 style={{ ...S.sectionTitle, marginTop: 28 }}>重設資料</h2>
-            <div style={S.formCard}>
-              <p style={{ ...S.bookingTime, marginBottom: 14, lineHeight: 1.6 }}>清除呢部裝置嘅所有資料，回復至初始狀態。建議先匯出備份。此動作無法復原。</p>
-              <button style={{ ...S.loginBtn, background: "#FF6B6B", color: "#fff" }} onClick={() => setResetModal(true)}>🗑️ 重設所有資料</button>
-            </div>
+            {currentUser.role === "admin" && (
+              <>
+                <h2 style={{ ...S.sectionTitle, marginTop: 28 }}>副管理員帳戶</h2>
+                <p style={S.gridHint}>副管理員可登入並使用下面開啟咗嘅分頁，但唔可以管理副管理員帳戶本身或重設資料。</p>
+                <div style={S.bookingList}>
+                  {subAdmins.map((s) => (
+                    <div key={s.id} style={S.formCard}>
+                      <Field label="顯示名稱"><input style={S.input} value={s.name} onChange={(e) => setSubAdmins((prev) => prev.map((x) => x.id === s.id ? { ...x, name: e.target.value } : x))} /></Field>
+                      <Field label="登入帳號名稱"><input style={S.input} value={s.username} onChange={(e) => {
+                        const v = e.target.value.trim().toLowerCase();
+                        if (v === "admin") { showToast("帳號名稱不可用 admin", "error"); return; }
+                        const dup = coaches.some((c) => (c.username || "").toLowerCase() === v) || subAdmins.some((x) => x.id !== s.id && (x.username || "").toLowerCase() === v);
+                        if (dup) { showToast("帳號名稱已被使用", "error"); return; }
+                        setSubAdmins((prev) => prev.map((x) => x.id === s.id ? { ...x, username: e.target.value } : x));
+                      }} /></Field>
+                      <Field label="密碼"><input style={S.input} value={s.password} onChange={(e) => setSubAdmins((prev) => prev.map((x) => x.id === s.id ? { ...x, password: e.target.value } : x))} /></Field>
+                      <label style={S.label}>可使用分頁</label>
+                      <div style={{ ...S.checkRow, flexWrap: "wrap", rowGap: 8 }}>
+                        {[["overview", "總覽"], ["schedule", "課表"], ["coaches", "教練"], ["ledger", "流水帳"], ["records", "記錄"], ["settings", "設定"]].map(([k, label]) => (
+                          <label key={k} style={S.checkLabel}>
+                            <input type="checkbox" checked={!!s.permissions?.[k]}
+                              onChange={(e) => setSubAdmins((prev) => prev.map((x) => x.id === s.id ? { ...x, permissions: { ...x.permissions, [k]: e.target.checked } } : x))} /> {label}
+                          </label>
+                        ))}
+                      </div>
+                      <button style={{ ...S.delBtn, marginTop: 12 }} onClick={() => { setSubAdmins((prev) => prev.filter((x) => x.id !== s.id)); showToast("已刪除副管理員"); }}>刪除呢個帳戶</button>
+                    </div>
+                  ))}
+                </div>
+                <button style={{ ...S.addBtn, marginTop: 12 }} onClick={() => {
+                  const newId = Math.max(0, ...subAdmins.map((s) => s.id)) + 1;
+                  setSubAdmins((prev) => [...prev, { id: newId, username: `subadmin${newId}`, password: "1234", name: `副管理員${newId}`, permissions: { overview: true, schedule: true, coaches: true, ledger: true, records: true, settings: true } }]);
+                }}>+ 新增副管理員</button>
+              </>
+            )}
+
+            {currentUser.role === "admin" && (
+              <>
+                <h2 style={{ ...S.sectionTitle, marginTop: 28 }}>重設資料</h2>
+                <div style={S.formCard}>
+                  <p style={{ ...S.bookingTime, marginBottom: 14, lineHeight: 1.6 }}>清除呢部裝置嘅所有資料，回復至初始狀態。建議先匯出備份。此動作無法復原。</p>
+                  <button style={{ ...S.loginBtn, background: "#FF6B6B", color: "#fff" }} onClick={() => setResetModal(true)}>🗑️ 重設所有資料</button>
+                </div>
+              </>
+            )}
           </div>
         )}
 
@@ -891,10 +1153,11 @@ export default function App() {
             <h3 style={S.modalTitle}>增加堂數</h3>
             <p style={S.modalText}>{getCoach(addCreditModal.coachId)?.name}　每堂 ${getCoach(addCreditModal.coachId)?.rate}</p>
             <Field label="增加幾多堂"><input style={S.input} type="number" min="1" value={addCreditModal.qty} onChange={(e) => setAddCreditModal({ ...addCreditModal, qty: parseInt(e.target.value) || 1 })} /></Field>
+            <Field label="失效日期（留空＝無限期）"><input style={S.input} type="date" value={addCreditModal.expiryDate || ""} onChange={(e) => setAddCreditModal({ ...addCreditModal, expiryDate: e.target.value })} /></Field>
             <p style={S.amountPreview}>金額：${((getCoach(addCreditModal.coachId)?.rate || 0) * addCreditModal.qty).toLocaleString()}</p>
             <div style={S.modalBtns}>
               <button style={S.modalCancel} onClick={() => setAddCreditModal(null)}>取消</button>
-              <button style={S.modalConfirm} onClick={() => { addCredits(addCreditModal.coachId, addCreditModal.qty); setAddCreditModal(null); }}>確認增加</button>
+              <button style={S.modalConfirm} onClick={() => { addCredits(addCreditModal.coachId, addCreditModal.qty, addCreditModal.expiryDate); setAddCreditModal(null); }}>確認增加</button>
             </div>
           </div></div>
         )}
@@ -973,7 +1236,8 @@ export default function App() {
         )}
 
         {adminCancelModal && (() => {
-          const within24 = adminCancelModal.type !== "charter" && hoursUntil(adminCancelModal.date, adminCancelModal.start) < 24;
+          const win = adminCancelModal.type !== "charter" ? (getCoach(adminCancelModal.coachId)?.cancelWindowHours ?? 24) : 24;
+          const within24 = adminCancelModal.type !== "charter" && hoursUntil(adminCancelModal.date, adminCancelModal.start) < win;
           const used = adminCancelModal.type !== "charter" ? assistUsedThisMonth(adminCancelModal.coachId) : 0;
           const over = within24 && used >= ASSIST_CANCEL_LIMIT;
           return (
@@ -986,7 +1250,7 @@ export default function App() {
                   {over ? "⚠️ 已超出本月代取消額度" : "✓ 屬本月代取消額度範圍"}
                 </div>
                 <div style={{ fontSize: 12, color: "#999", marginTop: 4 }}>
-                  {getCoach(adminCancelModal.coachId)?.name}　本月已用 {used} / {ASSIST_CANCEL_LIMIT} 次
+                  {getCoach(adminCancelModal.coachId)?.name}　本月已用 {used} / {ASSIST_CANCEL_LIMIT} 次（通知時數 {win} 小時）
                   {over ? "，今次將超額。" : "。"}
                 </div>
               </div>
@@ -1052,6 +1316,10 @@ export default function App() {
               <button style={{ ...S.modalConfirm, background: "#FF6B6B" }} onClick={() => {
                 try { localStorage.removeItem(LS_KEY); } catch (e) { /* ignore */ }
                 setCoaches(DEFAULT_COACHES); setAdminPassword("admin123"); setBookings({});
+                setSubAdmins([
+                  { id: 1, username: "subadmin1", password: "1234", name: "副管理員1", permissions: { overview: true, schedule: true, coaches: true, ledger: true, records: true, settings: true } },
+                  { id: 2, username: "subadmin2", password: "1234", name: "副管理員2", permissions: { overview: true, schedule: true, coaches: true, ledger: true, records: true, settings: true } },
+                ]);
                 setPurchaseLog([]); setCharterLog([]); setAssistCancelLog([]); setCancelLog([]);
                 setResetModal(false); showToast("已重設資料");
               }}>確認重設</button>
@@ -1074,19 +1342,32 @@ export default function App() {
         const left = Math.max(0, ASSIST_CANCEL_LIMIT - used);
         return (
           <div style={S.assistBar}>
-            <span>本月 24 小時內代取消額度</span>
+            <span>本月 {liveUser.cancelWindowHours ?? 24} 小時內代取消額度</span>
             <span style={{ color: left > 0 ? "#4ECDC4" : "#FF6B6B", fontWeight: 700 }}>剩 {left} / {ASSIST_CANCEL_LIMIT} 次</span>
           </div>
         );
       })()}
       {soldOut && <div style={S.soldOutBanner}>⚠️ 你已用晒購買堂數，請聯絡管理員增購後再預約</div>}
+      {isCoach && (() => {
+        const exp = expiringBatchesOf(currentUser.id);
+        if (exp.length === 0) return null;
+        return (
+          <div style={S.expiryBanner}>
+            ⏰ 你有 {exp.reduce((a, b) => a + b.remaining, 0)} 堂將於 {exp.map((b) => b.expiryDate).join("、")} 失效，請盡快預約使用
+          </div>
+        );
+      })()}
       <div style={S.tabRow}>
         <button style={view === "calendar" ? S.tabActive : S.tab} onClick={() => setView("calendar")}>📅 預約場地</button>
         <button style={view === "myBookings" ? S.tabActive : S.tab} onClick={() => setView("myBookings")}>📋 我的預約 {myBookings.length > 0 && <span style={S.badge}>{myBookings.length}</span>}</button>
+        <button style={view === "income" ? S.tabActive : S.tab} onClick={() => setView("income")}>📈 上堂情況</button>
         <button style={view === "pw" ? S.tabActive : S.tab} onClick={() => setView("pw")}>🔑 改密碼</button>
       </div>
 
-      {view === "calendar" && (
+      {view === "calendar" && (() => {
+        const dayPlans = {}; const dayCov = {};
+        days.forEach((d) => { const date = formatDate(d); dayPlans[date] = buildDayPlan(date); dayCov[date] = { whole: 0, lane0: 0, lane1: 0 }; });
+        return (
         <div style={S.calContainer}>
           <div style={S.weekNav}>
             <button style={S.navBtn} onClick={() => setWeekOffset((w) => w - 1)}>‹ 上週</button>
@@ -1097,61 +1378,89 @@ export default function App() {
           <div style={S.calScroll}>
             <table style={S.table}>
               <thead><tr><th style={S.thTime}></th>
-                {days.map((d) => { const closed = CLOSED_DAYS.includes(d.getDay()); const today = isTodayDate(d); return <th key={d} style={{ ...S.th, background: today ? "#13302e" : undefined }}><div style={{ ...S.dayLabel, color: closed ? "#5a3030" : undefined }}>{formatDay(d)}</div><div style={{ ...S.dateLabel, color: closed ? "#555" : today ? "#4ECDC4" : undefined }}>{d.getDate()}</div>{today ? <div style={S.todayTag}>今日</div> : closed ? <div style={S.closedTag}>休息</div> : null}</th>; })}
+                {days.map((d) => { const closed = CLOSED_DAYS.includes(d.getDay()); const today = isTodayDate(d); return <th key={d} colSpan={2} style={{ ...S.th, background: today ? "#13302e" : undefined }}><div style={{ ...S.dayLabel, color: closed ? "#5a3030" : undefined }}>{formatDay(d)}</div><div style={{ ...S.dateLabel, color: closed ? "#555" : today ? "#4ECDC4" : undefined }}>{d.getDate()}</div>{today ? <div style={S.todayTag}>今日</div> : closed ? <div style={S.closedTag}>休息</div> : null}</th>; })}
               </tr></thead>
               <tbody>
-                {TIME_SLOTS.map((time) => {
+                {TIME_SLOTS.map((time, rowIdx) => {
                   const isHourStart = time.endsWith(":00");
                   return (
                     <tr key={time}>
                       <td style={{ ...S.tdTime, color: isHourStart ? "#aaa" : "#3a3a3a" }}>{time}</td>
                       {days.map((d) => {
                         const date = formatDate(d);
-                        const here = cellArr(date, time);
-                        const occ = occupancy(date, time);
-                        const whole = here.find(isWholeVenue);
+                        const cov = dayCov[date];
+                        const cell = dayPlans[date][rowIdx];
                         const isPast = hoursUntil(date, time) < 0;
                         const closed = isClosedDay(date);
-                        const iAmHere = here.some((v) => v.coachId === currentUser.id && v.type !== "charter");
-                        const canAddHere = !whole && occ < MAX_CONCURRENT && !iAmHere && !isPast && !soldOut && !closed;
-                        return (
-                          <td key={date} style={{ ...S.td, borderTop: isHourStart ? "1px solid #2a2a2a" : "1px solid #161616", background: closed && here.length === 0 ? "#0c0c0c" : undefined }}>
-                            {whole ? (
-                              <div style={{ ...S.slotChip, background: "#ffffff22", borderLeft: "3px solid #fff", alignItems: "flex-start" }}>
-                                {isLabelRow(whole.start, whole.hours, time) && (
-                                  <span style={S.slotLabelBlock}>
-                                    <span style={S.slotNameFull}>{rentalShort(whole.charterType)}{whole.coachName ? ` · ${whole.coachName}` : ""}</span>
-                                    <span style={S.slotTimeFull}>{whole.start}–{addMinutes(whole.start, whole.hours * 60)}</span>
-                                  </span>
-                                )}
+                        const tdBase = { ...S.td, borderTop: isHourStart ? "1px solid #2a2a2a" : "1px solid #161616" };
+
+                        // 包場/小組：全場獨佔，colSpan=2
+                        if (cov.whole > 0) { cov.whole--; return null; }
+                        if (cell.whole) {
+                          const span = Math.round(cell.whole.hours * 4);
+                          cov.whole = span - 1;
+                          const lines = buildEntryLines(cell.whole, false, null, false);
+                          return (
+                            <td key={date} colSpan={2} rowSpan={span} style={tdBase}>
+                              <div style={{ ...S.slotChipMerged, background: "#ffffff22", borderLeft: "3px solid #fff" }}>
+                                {lines.map((l, i) => <span key={i} style={l.style}>{l.text}</span>)}
                               </div>
-                            ) : here.length > 0 ? (
-                              <div style={S.slotMulti}>
-                                {here.map((v, idx) => {
-                                  const showLabel = isLabelRow(v.start, v.hours, time);
-                                  const isTrial = v.type === "charter";
-                                  const c = isTrial ? null : getCoach(v.coachId);
-                                  return (
-                                    <div key={idx} style={{ ...S.slotChip, background: isTrial ? "#ffffff22" : c?.color + "33", borderLeft: `3px solid ${isTrial ? "#fff" : c?.color}`, alignItems: "flex-start" }}>
-                                      {showLabel && (
-                                        <span style={S.slotLabelBlock}>
-                                          <span style={S.slotNameFull}>{isTrial ? `試堂${v.coachName ? " · " + v.coachName : ""}` : `${c?.name}${v.type === "duo" ? " ²" : ""}`}</span>
-                                          <span style={S.slotTimeFull}>{v.start}–{addMinutes(v.start, v.hours * 60)}</span>
-                                        </span>
-                                      )}
-                                      {showLabel && !isTrial && v.coachId === currentUser.id && hoursUntil(date, v.start) >= 24 && !isPast &&
-                                        <button style={S.cancelSlotBtn} onClick={() => openCancel(date, v.start, v.coachId, v.type)}>✕</button>}
-                                    </div>
-                                  );
-                                })}
-                                {canAddHere && <button style={S.slotAdd} onClick={() => openBook(date, time)}>+</button>}
-                              </div>
-                            ) : closed ? <div style={S.slotClosed} />
-                              : isPast ? <div style={S.slotPast} />
-                              : soldOut ? <div style={S.slotDisabled} />
-                              : <button style={S.slotEmpty} onClick={() => openBook(date, time)}>+</button>}
-                          </td>
-                        );
+                            </td>
+                          );
+                        }
+
+                        // 兩條線都冇嘢、亦冇新 entry 開始 -> 一個 colSpan=2 嘅空格/「+」
+                        const lane0Active = cov.lane0 > 0 || cell.lane0;
+                        const lane1Active = cov.lane1 > 0 || cell.lane1;
+                        const occ = occupancy(date, time);
+                        if (!lane0Active && !lane1Active) {
+                          const iAmHere = false; // 完全空格，肯定唔係自己
+                          const canAddHere = occ < MAX_CONCURRENT && !isPast && !soldOut && !closed;
+                          return (
+                            <td key={date} colSpan={2} style={{ ...tdBase, background: closed ? "#0c0c0c" : undefined }}>
+                              {closed ? <div style={S.slotClosed} />
+                                : isPast ? <div style={S.slotPast} />
+                                : soldOut ? <div style={S.slotDisabled} />
+                                : <button style={S.slotEmpty} onClick={() => openBook(date, time)}>+</button>}
+                            </td>
+                          );
+                        }
+
+                        // 逐條線獨立處理
+                        const laneTd = (laneKey) => {
+                          if (cov[laneKey] > 0) { cov[laneKey]--; return null; }
+                          const v = cell[laneKey];
+                          if (v) {
+                            const span = Math.round(v.hours * 4);
+                            cov[laneKey] = span - 1;
+                            const isTrial = v.type === "charter";
+                            const c = isTrial ? null : getCoach(v.coachId);
+                            const isOwner = currentUser.role === "coach" && v.coachId === currentUser.id;
+                            const lines = buildEntryLines(v, isTrial, c, isOwner);
+                            const showCancel = !isTrial && v.coachId === currentUser.id && hoursUntil(date, v.start) >= (liveUser.cancelWindowHours ?? 24) && !isPast;
+                            return (
+                              <td key={date + laneKey} rowSpan={span} style={tdBase}>
+                                <div style={{ ...S.slotChipMerged, background: isTrial ? "#ffffff22" : c?.color + "33", borderLeft: `3px solid ${isTrial ? "#fff" : c?.color}` }}>
+                                  {showCancel && <button style={S.cancelSlotBtnAbs} onClick={() => openCancel(date, v.start, v.coachId, v.type)}>✕</button>}
+                                  {lines.map((l, i) => <span key={i} style={l.style}>{l.text}</span>)}
+                                </div>
+                              </td>
+                            );
+                          }
+                          // 呢條線喺呢一行係空嘅（可能另一條線正佔住個 booking）
+                          const canAddHere = occ < MAX_CONCURRENT && !isPast && !soldOut && !closed;
+                          return (
+                            <td key={date + laneKey} style={{ ...tdBase, background: closed ? "#0c0c0c" : undefined }}>
+                              {closed ? <div style={S.slotClosed} />
+                                : isPast ? <div style={S.slotPast} />
+                                : soldOut ? <div style={S.slotDisabled} />
+                                : canAddHere ? <button style={S.slotAdd2} onClick={() => openBook(date, time)}>+</button>
+                                : <div style={S.slotDisabled} />}
+                            </td>
+                          );
+                        };
+
+                        return <>{laneTd("lane0")}{laneTd("lane1")}</>;
                       })}
                     </tr>
                   );
@@ -1161,23 +1470,36 @@ export default function App() {
           </div>
           <p style={S.assistHint}>可預約任何時段；24小時內取消需管理員協助。² = 1對2</p>
         </div>
-      )}
+        );
+      })()}
 
       {view === "myBookings" && (
         <div style={S.container}>
           <h2 style={S.sectionTitle}>我的預約記錄</h2>
           {myBookings.length === 0 ? <p style={S.emptyText}>你還未有預約</p> : (
             <div style={S.bookingList}>
-              {myBookings.map(({ date, start, hours, type }, i) => {
+              {myBookings.map(({ date, start, hours, type, students, signatures }, i) => {
                 const hrs = hoursUntil(date, start);
                 const isPast = hrs < 0;
-                const locked = hrs >= 0 && hrs < 24;
+                const locked = hrs >= 0 && hrs < (liveUser.cancelWindowHours ?? 24);
                 return (
                   <div key={i} style={S.bookingItem}>
                     <div style={{ ...S.dot, background: liveUser.color }} />
                     <div style={{ flex: 1 }}>
                       <div style={S.bookingCoach}>{date} <span style={type === "duo" ? S.duoTag : S.soloTag}>{type === "duo" ? "1對2" : "1對1"}</span></div>
                       <div style={S.bookingTime}>{start} – {addMinutes(start, hours * 60)}（{hours}小時）</div>
+                      {students && students.length > 0 && (
+                        <div style={S.signRow}>
+                          {students.map((name) => {
+                            const signed = signatures && signatures[name];
+                            return (
+                              <button key={name} style={signed ? S.signedChip : S.signChip} onClick={() => !signed && setSignModal({ date, start, coachId: currentUser.id, type, studentName: name })}>
+                                {signed ? `✓ ${name}` : `✍️ ${name}`}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                     {isPast ? <span style={S.pastTag}>已完成</span>
                       : locked ? <span style={S.lockTag}>🔒 取消需管理員</span>
@@ -1189,6 +1511,72 @@ export default function App() {
           )}
         </div>
       )}
+
+      {view === "income" && (() => {
+        const roster = liveUser.studentRoster || [];
+        return (
+        <div style={S.container}>
+          <h2 style={S.sectionTitle}>我的收入（近3個月）</h2>
+          <p style={S.assistHint}>實際收入＝收費 － 租場費用（每堂租金 × 時長）。一對一通常為 $0（收費等於租場費用）；一對二／多人堂多收嘅部分先計入收入。</p>
+          <div style={S.bookingList}>
+            {myIncomeReport.months.map((m) => (
+              <div key={m.month} style={S.monthCard}>
+                <div style={S.monthHead}>{m.month}{m.month === monthKey(formatDate(new Date())) ? "（本月）" : ""}</div>
+                <div style={S.monthRow}><span style={S.monthLabel}>堂數</span><span>{m.count} 堂</span></div>
+                <div style={S.monthRow}><span style={S.monthLabel}>總收費</span><span>${m.gross.toLocaleString()}</span></div>
+                <div style={S.monthRow}><span style={S.monthLabel}>租場費用</span><span style={{ color: "#FF8FA3" }}>-${m.rentalCost.toLocaleString()}</span></div>
+                <div style={S.monthRow}><span style={{ ...S.monthLabel, fontWeight: 700, color: "#fff" }}>實際收入</span><span style={{ color: m.net >= 0 ? "#6BCB77" : "#FF6B6B", fontWeight: 700 }}>${m.net.toLocaleString()}</span></div>
+              </div>
+            ))}
+          </div>
+
+          <h2 style={{ ...S.sectionTitle, marginTop: 28 }}>學生名單</h2>
+          <p style={S.assistHint}>呢度新增嘅學生名，預約場地時可以直接喺名單度揀，唔使逐次打字。</p>
+          <div style={S.studentChipWrap}>
+            {roster.map((name) => (
+              <span key={name} style={S.rosterChip}>
+                {name}
+                <button style={S.rosterRemoveBtn} onClick={() => setCoaches((prev) => prev.map((c) => c.id === currentUser.id ? { ...c, studentRoster: (c.studentRoster || []).filter((n) => n !== name) } : c))}>✕</button>
+              </span>
+            ))}
+            {roster.length === 0 && <p style={S.emptyText}>仲未有學生，落面新增啦</p>}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <input style={S.input} value={newStudentName} placeholder="新學生名" onChange={(e) => setNewStudentName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addStudentToRoster()} />
+            <button style={{ ...S.creditBtn, whiteSpace: "nowrap" }} onClick={addStudentToRoster}>新增</button>
+          </div>
+
+          <h2 style={{ ...S.sectionTitle, marginTop: 28 }}>學生上課紀錄</h2>
+          {roster.length === 0 ? <p style={S.emptyText}>新增學生後，呢度會顯示佢哋嘅上堂紀錄</p> : (
+            <div style={S.bookingList}>
+              {roster.map((name) => {
+                const log = myIncomeReport.studentLog[name] || [];
+                const open = studentLogOpen === name;
+                return (
+                  <div key={name}>
+                    <div style={{ ...S.coachStatRow, cursor: "pointer" }} onClick={() => setStudentLogOpen(open ? null : name)}>
+                      <div style={{ ...S.avatar, background: liveUser.color }}>{name.slice(0, 2)}</div>
+                      <div style={{ flex: 1 }}><div style={S.bookingCoach}>{name}</div><div style={S.bookingTime}>共 {log.length} 堂</div></div>
+                    </div>
+                    {open && (
+                      <div style={S.purchaseBreakdown}>
+                        {log.length === 0 ? <p style={S.emptyText}>暫無紀錄</p> : log.map((l, i) => (
+                          <div key={i} style={S.purchaseRow}>
+                            <div style={S.bookingTime}>{l.date} · {l.start}–{addMinutes(l.start, l.hours * 60)}</div>
+                            <span style={l.type === "duo" ? S.duoTag : S.soloTag}>{l.type === "duo" ? "1對2" : "1對1"}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        );
+      })()}
 
       {view === "pw" && (
         <div style={S.container}>
@@ -1205,20 +1593,44 @@ export default function App() {
       {bookModal && (() => {
         const isDuo = bookModal.sessionType === "duo";
         const price = isDuo ? duoPrice(bookModal.hours) : liveUser.rate * bookModal.hours;
+        const allowSolo = liveUser.allowSolo !== false;
+        const allowDuo = liveUser.allowDuo !== false;
         return (
           <div style={S.modalOverlay}><div style={{ ...S.modal, textAlign: "left" }}>
             <h3 style={{ ...S.modalTitle, textAlign: "center" }}>預約場地</h3>
             <p style={{ ...S.modalText, textAlign: "center" }}>{bookModal.date}　{bookModal.time}</p>
             <label style={S.label}>類型</label>
             <div style={S.segRow}>
-              <button style={!isDuo ? S.segActive : S.seg} onClick={() => setBookModal({ ...bookModal, sessionType: "solo" })}>1對1</button>
-              <button style={isDuo ? S.segActive : S.seg} onClick={() => setBookModal({ ...bookModal, sessionType: "duo" })}>1對2</button>
+              <button style={!allowSolo ? S.segDisabled : !isDuo ? S.segActive : S.seg} disabled={!allowSolo} onClick={() => allowSolo && setBookModal({ ...bookModal, sessionType: "solo" })}>1對1</button>
+              <button style={!allowDuo ? S.segDisabled : isDuo ? S.segActive : S.seg} disabled={!allowDuo} onClick={() => allowDuo && setBookModal({ ...bookModal, sessionType: "duo" })}>1對2</button>
             </div>
             <label style={{ ...S.label, marginTop: 14 }}>時長</label>
             <div style={S.segRow}>
               <button style={bookModal.hours === 1 ? S.segActive : S.seg} onClick={() => setBookModal({ ...bookModal, hours: 1 })}>1 小時</button>
               <button style={bookModal.hours === 1.5 ? S.segActive : S.seg} onClick={() => setBookModal({ ...bookModal, hours: 1.5 })}>1.5 小時</button>
             </div>
+            <label style={{ ...S.label, marginTop: 14 }}>學生（最多4位，只有你自己睇到）</label>
+            {(liveUser.studentRoster || []).length === 0 ? (
+              <p style={S.assistHint}>你仲未有學生名單，可以喺「上堂情況」分頁新增。</p>
+            ) : (
+              <div style={S.studentChipWrap}>
+                {(liveUser.studentRoster || []).map((name) => {
+                  const sel = Array.isArray(bookModal.students) && bookModal.students.includes(name);
+                  const atMax = !sel && (bookModal.students || []).length >= 4;
+                  return (
+                    <button key={name} disabled={atMax} style={sel ? S.studentChipActive : atMax ? S.studentChipDisabled : S.studentChip}
+                      onClick={() => {
+                        const cur = bookModal.students || [];
+                        setBookModal({ ...bookModal, students: sel ? cur.filter((n) => n !== name) : [...cur, name] });
+                      }}>{name}</button>
+                  );
+                })}
+              </div>
+            )}
+            {(bookModal.students || []).length < 4 && (
+              <input style={{ ...S.input, marginTop: 8 }} value={bookModal.studentOther || ""} placeholder="其他（唔在名單，打名就得）"
+                onChange={(e) => setBookModal({ ...bookModal, studentOther: e.target.value })} />
+            )}
             <div style={S.priceBox}>
               <div style={S.priceRow}><span>時段</span><span>{bookModal.time} – {addMinutes(bookModal.time, bookModal.hours * 60)}</span></div>
               <div style={S.priceRow}><span>扣堂數</span><span>{bookModal.hours} 堂</span></div>
@@ -1242,13 +1654,21 @@ export default function App() {
           </div>
         </div></div>
       )}
+      {signModal && (
+        <SignaturePad studentName={signModal.studentName}
+          onCancel={() => setSignModal(null)}
+          onSave={(dataUrl) => { signIn(signModal.date, signModal.start, signModal.coachId, signModal.type, signModal.studentName, dataUrl); setSignModal(null); }} />
+      )}
       {toast && <Toast toast={toast} />}
     </div>
   );
 }
 
 function EditCoachModal({ coach, onClose, onSave }) {
-  const [form, setForm] = useState({ id: coach.id, username: coach.username || "", name: coach.name, credits: coach.credits, rate: coach.rate, password: coach.password });
+  const [form, setForm] = useState({
+    id: coach.id, username: coach.username || "", name: coach.name, credits: coach.credits, rate: coach.rate, password: coach.password,
+    allowSolo: coach.allowSolo !== false, allowDuo: coach.allowDuo !== false, cancelWindowHours: coach.cancelWindowHours || 24,
+  });
   return (
     <div style={S.modalOverlay}><div style={{ ...S.modal, width: 320, textAlign: "left" }}>
       <h3 style={S.modalTitle}>{coach.id ? "編輯教練" : "新增教練"}</h3>
@@ -1257,6 +1677,12 @@ function EditCoachModal({ coach, onClose, onSave }) {
       <Field label={coach.id ? "總購買堂數" : "初始購買堂數"}><input style={S.input} type="number" value={form.credits} onChange={(e) => setForm({ ...form, credits: parseInt(e.target.value) || 0 })} /></Field>
       <Field label="一對一每堂租金 ($)"><input style={S.input} type="number" value={form.rate} onChange={(e) => setForm({ ...form, rate: parseInt(e.target.value) || 0 })} /></Field>
       <Field label="密碼"><input style={S.input} value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></Field>
+      <label style={S.label}>預約權限</label>
+      <div style={S.checkRow}>
+        <label style={S.checkLabel}><input type="checkbox" checked={form.allowSolo} onChange={(e) => setForm({ ...form, allowSolo: e.target.checked })} /> 允許一對一</label>
+        <label style={S.checkLabel}><input type="checkbox" checked={form.allowDuo} onChange={(e) => setForm({ ...form, allowDuo: e.target.checked })} /> 允許一對二</label>
+      </div>
+      <Field label="取消需管理員協助嘅時數（小時）"><input style={S.input} type="number" min="0" value={form.cancelWindowHours} onChange={(e) => setForm({ ...form, cancelWindowHours: parseInt(e.target.value) || 0 })} /></Field>
       {!coach.id && form.credits > 0 && <p style={S.amountPreview}>初始堂數記入流水帳：${(form.credits * form.rate).toLocaleString()}</p>}
       <div style={S.modalBtns}>
         <button style={S.modalCancel} onClick={onClose}>取消</button>
@@ -1267,6 +1693,71 @@ function EditCoachModal({ coach, onClose, onSave }) {
 }
 
 function Field({ label, children }) { return <div style={S.inputGroup}><label style={S.label}>{label}</label>{children}</div>; }
+
+// 簽名板：支援滑鼠同觸控（手機）畫簽名，輸出 base64 PNG
+function SignaturePad({ studentName, onSave, onCancel }) {
+  const canvasRef = useRef(null);
+  const drawingRef = useRef(false);
+  const hasDrawnRef = useRef(false);
+  const lastPos = useRef({ x: 0, y: 0 });
+
+  const getCtx = () => canvasRef.current?.getContext("2d");
+
+  const posFromEvent = (e) => {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const point = e.touches ? e.touches[0] : e;
+    return { x: point.clientX - rect.left, y: point.clientY - rect.top };
+  };
+
+  const start = (e) => {
+    e.preventDefault();
+    drawingRef.current = true;
+    hasDrawnRef.current = true;
+    lastPos.current = posFromEvent(e);
+  };
+  const move = (e) => {
+    if (!drawingRef.current) return;
+    e.preventDefault();
+    const ctx = getCtx();
+    const pos = posFromEvent(e);
+    ctx.strokeStyle = "#000"; ctx.lineWidth = 2.5; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(lastPos.current.x, lastPos.current.y); ctx.lineTo(pos.x, pos.y); ctx.stroke();
+    lastPos.current = pos;
+  };
+  const end = () => { drawingRef.current = false; };
+
+  const clear = () => {
+    const canvas = canvasRef.current;
+    const ctx = getCtx();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    hasDrawnRef.current = false;
+  };
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    canvas.width = canvas.offsetWidth * 2; canvas.height = canvas.offsetHeight * 2;
+    const ctx = canvas.getContext("2d");
+    ctx.scale(2, 2);
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.offsetWidth, canvas.offsetHeight);
+  }, []);
+
+  return (
+    <div style={S.modalOverlay}><div style={{ ...S.modal, width: 320 }}>
+      <h3 style={S.modalTitle}>學生簽到</h3>
+      <p style={S.modalText}>{studentName}　請喺下面簽名作實</p>
+      <canvas ref={canvasRef} style={S.signCanvas}
+        onMouseDown={start} onMouseMove={move} onMouseUp={end} onMouseLeave={end}
+        onTouchStart={start} onTouchMove={move} onTouchEnd={end} />
+      <div style={S.modalBtns}>
+        <button style={S.modalCancel} onClick={clear}>清除</button>
+        <button style={S.modalCancel} onClick={onCancel}>返回</button>
+        <button style={S.modalConfirm} onClick={() => { if (!hasDrawnRef.current) return; onSave(canvasRef.current.toDataURL("image/png")); }}>確認簽到</button>
+      </div>
+    </div></div>
+  );
+}
 function Header({ title, onLogout, syncState }) {
   const sync = {
     synced: { t: "☁️ 已同步", c: "#6BCB77" },
@@ -1298,6 +1789,7 @@ const S = {
   assistBar: { display: "flex", justifyContent: "space-between", padding: "8px 20px", background: "#121212", fontSize: 12, color: "#888", borderBottom: "1px solid #222" },
   quotaBox: { border: "1px solid", borderRadius: 10, padding: "10px 12px", margin: "0 0 16px" },
   soldOutBanner: { background: "#3a1515", color: "#FF8FA3", padding: "10px 20px", fontSize: 13, textAlign: "center", borderBottom: "1px solid #5a2020" },
+  expiryBanner: { background: "#332a0f", color: "#FFB347", padding: "10px 20px", fontSize: 13, textAlign: "center", borderBottom: "1px solid #5a4a1a" },
   tabRow: { display: "flex", borderBottom: "1px solid #222", background: "#151515", overflowX: "auto" },
   tab: { flex: 1, background: "transparent", border: "none", color: "#666", padding: "14px 6px", fontSize: 12, cursor: "pointer", whiteSpace: "nowrap", display: "flex", alignItems: "center", justifyContent: "center", gap: 4 },
   tabActive: { flex: 1, background: "transparent", border: "none", color: "#4ECDC4", padding: "14px 6px", fontSize: 12, cursor: "pointer", borderBottom: "2px solid #4ECDC4", fontWeight: 700, whiteSpace: "nowrap", display: "flex", alignItems: "center", justifyContent: "center", gap: 4 },
@@ -1318,14 +1810,20 @@ const S = {
   td: { padding: "1px", borderLeft: "1px solid #161616" },
   slotMulti: { display: "flex", gap: 1, minHeight: 30 },
   slotChip: { flex: 1, borderRadius: 3, padding: "2px 3px", display: "flex", alignItems: "center", justifyContent: "space-between", minHeight: 30, minWidth: 0 },
+  slotChipMerged: { borderRadius: 3, display: "flex", flexDirection: "column", justifyContent: "space-between", position: "relative", height: "100%", minHeight: 30, padding: "4px 6px", boxSizing: "border-box" },
   slotName: { fontSize: 10, fontWeight: 700, color: "#fff" },
   slotNameFull: { fontSize: 9, fontWeight: 700, color: "#fff", lineHeight: 1.1, wordBreak: "break-word", overflow: "hidden" },
   slotLabelBlock: { display: "flex", flexDirection: "column", gap: 1, minWidth: 0, overflow: "hidden" },
   slotTimeFull: { fontSize: 8, color: "#ffffffcc", lineHeight: 1.1, whiteSpace: "nowrap", overflow: "hidden" },
+  slotTypeFull: { fontSize: 8, color: "#ffffffaa", lineHeight: 1.1, whiteSpace: "nowrap", overflow: "hidden" },
+  slotStudentsFull: { fontSize: 8, color: "#FFE66D", fontWeight: 700, lineHeight: 1.1, wordBreak: "break-word", overflow: "hidden" },
+  slotBottomTime: { fontSize: 8, color: "#ffffffaa", lineHeight: 1.1, marginTop: "auto", whiteSpace: "nowrap", overflow: "hidden" },
   cancelSlotBtn: { background: "transparent", border: "none", color: "#fff", cursor: "pointer", fontSize: 10, padding: 0 },
+  cancelSlotBtnAbs: { position: "absolute", top: 2, right: 2, background: "transparent", border: "none", color: "#fff", cursor: "pointer", fontSize: 10, padding: 0, zIndex: 1 },
   slotEmpty: { width: "100%", minHeight: 20, background: "#1a1a1a", border: "none", borderRadius: 3, color: "#3a3a3a", fontSize: 13, cursor: "pointer" },
   slotEmptyRO: { minHeight: 20, background: "#1a1a1a", borderRadius: 3 },
   slotAdd: { width: 18, minHeight: 30, background: "#202020", border: "1px dashed #3a3a3a", borderRadius: 3, color: "#6BCB77", fontSize: 12, cursor: "pointer", flexShrink: 0 },
+  slotAdd2: { width: "100%", minHeight: 26, background: "#202020", border: "1px dashed #3a3a3a", borderRadius: 3, color: "#6BCB77", fontSize: 12, cursor: "pointer" },
   slotPast: { minHeight: 20, background: "#111", borderRadius: 3 },
   slotDisabled: { minHeight: 20, background: "#141414", borderRadius: 3 },
   slotClosed: { minHeight: 20, background: "#0c0c0c", borderRadius: 3 },
@@ -1372,6 +1870,8 @@ const S = {
   donePill: { fontSize: 10, color: "#888", background: "#222", padding: "1px 6px", borderRadius: 6, marginLeft: 6 },
   recDetail: { marginTop: 8, padding: "8px 10px", background: "#141414", borderRadius: 8, fontSize: 12, color: "#aaa", lineHeight: 1.7 },
   lowWarnBox: { background: "#3a1515", color: "#FF8FA3", borderRadius: 10, padding: "10px 12px", fontSize: 12, marginTop: 12, lineHeight: 1.6 },
+  purchaseBreakdown: { background: "#141414", borderRadius: 10, padding: "8px 12px", marginTop: 4, marginBottom: 4, display: "flex", flexDirection: "column", gap: 8 },
+  purchaseRow: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", borderBottom: "1px solid #222", paddingBottom: 8 },
   lowPill: { fontSize: 10, color: "#fff", background: "#FF6B6B", padding: "1px 6px", borderRadius: 6, marginLeft: 6, fontWeight: 700 },
   filterLabel: { fontSize: 13, color: "#aaa" },
   select: { background: "#2a2a2a", border: "1px solid #333", borderRadius: 8, padding: "8px 12px", color: "#fff", fontSize: 13, outline: "none" },
@@ -1379,11 +1879,24 @@ const S = {
   assistHint: { color: "#666", fontSize: 12, marginTop: 16 },
   amountPreview: { color: "#6BCB77", fontSize: 13, fontWeight: 600, margin: "4px 0 12px" },
   segRow: { display: "flex", gap: 8 },
+  checkRow: { display: "flex", gap: 16, marginBottom: 16 },
+  studentChipWrap: { display: "flex", gap: 6, flexWrap: "wrap" },
+  studentChip: { background: "#2a2a2a", border: "1px solid #333", color: "#ccc", borderRadius: 16, padding: "6px 12px", fontSize: 12, cursor: "pointer" },
+  studentChipActive: { background: "#4ECDC4", border: "1px solid #4ECDC4", color: "#000", borderRadius: 16, padding: "6px 12px", fontSize: 12, cursor: "pointer", fontWeight: 700 },
+  studentChipDisabled: { background: "#1a1a1a", border: "1px solid #222", color: "#444", borderRadius: 16, padding: "6px 12px", fontSize: 12, cursor: "not-allowed" },
+  rosterChip: { display: "inline-flex", alignItems: "center", gap: 6, background: "#2a2a2a", border: "1px solid #333", color: "#ccc", borderRadius: 16, padding: "6px 8px 6px 12px", fontSize: 12 },
+  rosterRemoveBtn: { background: "transparent", border: "none", color: "#FF8FA3", cursor: "pointer", fontSize: 12, padding: "0 2px" },
+  checkLabel: { display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: "#ccc", cursor: "pointer" },
   seg: { flex: 1, background: "#2a2a2a", border: "1px solid #333", color: "#aaa", borderRadius: 10, padding: "10px", cursor: "pointer", fontSize: 14 },
   segActive: { flex: 1, background: "#4ECDC4", border: "1px solid #4ECDC4", color: "#000", borderRadius: 10, padding: "10px", cursor: "pointer", fontSize: 14, fontWeight: 700 },
+  segDisabled: { flex: 1, background: "#1a1a1a", border: "1px solid #2a2a2a", color: "#444", borderRadius: 10, padding: "10px", cursor: "not-allowed", fontSize: 14 },
   priceBox: { background: "#222", borderRadius: 10, padding: "12px 14px", margin: "16px 0" },
   priceRow: { display: "flex", justifyContent: "space-between", fontSize: 13, color: "#aaa", padding: "3px 0" },
   modalOverlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 20 },
+  signCanvas: { width: "100%", height: 160, background: "#fff", borderRadius: 10, touchAction: "none", display: "block" },
+  signRow: { display: "flex", gap: 6, flexWrap: "wrap", marginTop: 6 },
+  signChip: { background: "#2a2a2a", border: "1px solid #333", color: "#FFB347", borderRadius: 12, padding: "4px 10px", fontSize: 11, cursor: "pointer" },
+  signedChip: { background: "#13302e", border: "1px solid #1d3a2a", color: "#6BCB77", borderRadius: 12, padding: "4px 10px", fontSize: 11, cursor: "default" },
   modal: { background: "#1a1a1a", borderRadius: 16, padding: "28px 24px", width: 320, textAlign: "center", maxHeight: "85vh", overflowY: "auto" },
   modalTitle: { fontSize: 18, fontWeight: 700, marginBottom: 12 },
   modalText: { color: "#aaa", marginBottom: 20, lineHeight: 1.6 },
